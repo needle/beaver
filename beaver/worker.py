@@ -1,11 +1,9 @@
 import errno
-import glob
-import logging
 import os
 import stat
-import sys
 import time
-from transport import TransportException
+
+from beaver.utils import REOPEN_FILES, eglob
 
 
 class Worker(object):
@@ -22,71 +20,189 @@ class Worker(object):
     >>> l.loop()
     """
 
-    def __init__(self, configfile, args, callback, extensions=["log"], tail_lines=0):
+    def __init__(self, beaver_config, file_config, queue_consumer_function, callback, logger=None, tail_lines=0):
         """Arguments:
 
-        (str) @args:
-            set of arguments for the worker
+        (FileConfig) @file_config:
+            object containing file-related configuration
+
+        (BeaverConfig) @beaver_config:
+            object containing global configuration
+
+        (Logger) @logger
+            object containing a python logger
 
         (callable) @callback:
             a function which is called every time a new line in a
             file being watched is found;
             this is called with "filename" and "lines" arguments.
 
-        (list) @extensions:
-            only watch files with these extensions
-
         (int) @tail_lines:
             read last N lines from files being watched before starting
         """
-        self.args = args
-        self.configfile = configfile
-        self.callback = callback
-        self.extensions = extensions
-        self.files_map = {}
-        self.logger = logging.getLogger('beaver')
+        self._beaver_config = beaver_config
+        self._callback = callback
+        self._create_queue_consumer = queue_consumer_function
+        self._file_config = file_config
+        self._file_map = {}
+        self._folder = self._beaver_config.get('path')
+        self._logger = logger
+        self._proc = None
+        self._update_time = None
 
-        if self.args.path is not None:
-            self.folder = os.path.realpath(args.path)
-            assert os.path.isdir(self.folder), "%s does not exists" \
-                                            % self.folder
-        assert callable(callback)
+        if not callable(self._callback):
+            raise RuntimeError("Callback for worker is not callable")
+
         self.update_files()
         # The first time we run the script we move all file markers at EOF.
         # In case of files created afterwards we don't do this.
-        for id, file in self.files_map.iteritems():
+        for id, file in self._file_map.iteritems():
             file.seek(os.path.getsize(file.name))  # EOF
             if tail_lines:
                 lines = self.tail(file.name, tail_lines)
                 if lines:
-                    self.callback(file.name, lines)
+                    self._callback(("callback", (file.name, lines)))
 
     def __del__(self):
+        """Closes all files"""
         self.close()
 
-    def loop(self, interval=0.1, async=False):
-        """Start the loop.
-        If async is True make one loop then return.
-        """
-        while 1:
-            self.update_files()
-            for fid, file in list(self.files_map.iteritems()):
-                self.readfile(file)
-            if async:
-                return
-            time.sleep(interval)
+    def close(self):
+        """Closes all currently open file pointers"""
+        for id, file in self._file_map.iteritems():
+            file.close()
+        self._file_map.clear()
 
     def listdir(self):
         """List directory and filter files by extension.
         You may want to override this to add extra logic or
         globbling support.
         """
-        ls = os.listdir(self.folder)
-        if self.extensions:
-            return [x for x in ls if os.path.splitext(x)[1][1:] \
-                                           in self.extensions]
+        ls = os.listdir(self._folder)
+        return [x for x in ls if os.path.splitext(x)[1][1:] == "log"]
+
+    def loop(self, interval=0.1, async=False):
+        """Start the loop.
+        If async is True make one loop then return.
+        """
+        while 1:
+            t = time.time()
+            if not (self._proc and self._proc.is_alive()):
+                self._proc = self._create_queue_consumer()
+
+            if int(time.time()) - self._update_time > self._beaver_config.get('update_file_mapping_time'):
+                self.update_files()
+
+            for fid, file in list(self._file_map.iteritems()):
+                try:
+                    self.readfile(fid, file)
+                except IOError, e:
+                    if e.errno == errno.ESTALE:
+                        self.unwatch(file, fid)
+            if async:
+                return
+
+            self._logger.debug("Iteration took {0}".format(time.time() - t))
+            time.sleep(interval)
+
+    def readfile(self, fid, file):
+        """Read lines from a file and performs a callback against them"""
+        lines = file.readlines(4096)
+        while lines:
+            self._callback(("callback", (file.name, lines)))
+            lines = file.readlines(4096)
+
+    def update_files(self):
+        """Ensures all files are properly loaded.
+        Detects new files, file removals, file rotation, and truncation.
+        On non-linux platforms, it will also manually reload the file for tailing.
+        Note that this hack is necessary because EOF is cached on BSD systems.
+        """
+        self._update_time = int(time.time())
+
+        ls = []
+        files = []
+        if len(self._beaver_config.get('globs')) > 0:
+            for name in self._beaver_config.get('globs'):
+                globbed = [os.path.realpath(filename) for filename in eglob(name)]
+                files.extend(globbed)
+                self._file_config.addglob(name, globbed)
         else:
-            return ls
+            for name in self.listdir():
+                files.append(os.path.realpath(os.path.join(self._folder, name)))
+
+        for absname in files:
+            try:
+                st = os.stat(absname)
+            except EnvironmentError, err:
+                if err.errno != errno.ENOENT:
+                    raise
+            else:
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                fid = self.get_file_id(st)
+                ls.append((fid, absname))
+
+        # check existent files
+        for fid, file in list(self._file_map.iteritems()):
+            try:
+                st = os.stat(file.name)
+            except EnvironmentError, err:
+                if err.errno == errno.ENOENT:
+                    self.unwatch(file, fid)
+                else:
+                    raise
+            else:
+                if fid != self.get_file_id(st):
+                    self._logger.info("[{0}] - file rotated {1}".format(fid, file.name))
+                    self.unwatch(file, fid)
+                    self.watch(file.name)
+                elif file.tell() > st.st_size:
+                    self._logger.info("[{0}] - file truncated {1}".format(fid, file.name))
+                    self.unwatch(file, fid)
+                    self.watch(file.name)
+                elif REOPEN_FILES:
+                    self._logger.debug("[{0}] - file reloaded (non-linux) {1}".format(fid, file.name))
+                    position = file.tell()
+                    fname = file.name
+                    file.close()
+                    file = open(fname, "r")
+                    file.seek(position)
+                    self._file_map[fid] = file
+
+        # add new ones
+        for fid, fname in ls:
+            if fid not in self._file_map:
+                self.watch(fname)
+
+    def unwatch(self, file, fid):
+        """file no longer exists; if it has been renamed
+        try to read it for the last time in case the
+        log rotator has written something in it.
+        """
+        try:
+            self.readfile(fid, file)
+        except IOError:
+            # Silently ignore any IOErrors -- file is gone
+            pass
+        self._logger.info("[{0}] - un-watching logfile {1}".format(fid, file.name))
+        del self._file_map[fid]
+
+    def watch(self, fname):
+        """Opens a file for log tailing"""
+        try:
+            file = open(fname, "r")
+            fid = self.get_file_id(os.stat(fname))
+        except EnvironmentError, err:
+            if err.errno != errno.ENOENT:
+                raise
+        else:
+            self._logger.info("[{0}] - watching logfile {1}".format(fid, fname))
+            self._file_map[fid] = file
+
+    @staticmethod
+    def get_file_id(st):
+        return "%xg%x" % (st.st_dev, st.st_ino)
 
     @staticmethod
     def tail(fname, window):
@@ -118,133 +234,3 @@ class Worker(object):
                 else:
                     block -= 1
             return data.splitlines()[-window:]
-
-    def update_files(self):
-        ls = []
-        files = []
-        if len(self.args.globs) > 0:
-            for name in self.args.globs:
-                globbed = [os.path.realpath(filename) for filename in glob.glob(name)]
-                files.extend(globbed)
-                self.configfile.addglob(name, globbed)
-        else:
-            for name in self.listdir():
-                files.append(os.path.realpath(os.path.join(self.folder, name)))
-
-        for absname in files:
-            try:
-                st = os.stat(absname)
-            except EnvironmentError, err:
-                if err.errno != errno.ENOENT:
-                    raise
-            else:
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                fid = self.get_file_id(st)
-                ls.append((fid, absname))
-
-        # check existent files
-        for fid, file in list(self.files_map.iteritems()):
-            try:
-                st = os.stat(file.name)
-            except EnvironmentError, err:
-                if err.errno == errno.ENOENT:
-                    self.unwatch(file, fid)
-                else:
-                    raise
-            else:
-                if fid != self.get_file_id(st):
-                    # same name but different file (rotation); reload it.
-                    self.unwatch(file, fid)
-                    self.watch(file.name)
-
-        # add new ones
-        for fid, fname in ls:
-            if fid not in self.files_map:
-                self.watch(fname)
-
-    def readfile(self, file):
-        lines = file.readlines()
-        if lines:
-            self.callback(file.name, lines)
-
-    def watch(self, fname):
-        try:
-            file = open(fname, "r")
-            fid = self.get_file_id(os.stat(fname))
-        except EnvironmentError, err:
-            if err.errno != errno.ENOENT:
-                raise
-        else:
-            self.logger.info("[{0}] - watching logfile {1}".format(fid, fname))
-            self.files_map[fid] = file
-
-    def unwatch(self, file, fid):
-        # file no longer exists; if it has been renamed
-        # try to read it for the last time in case the
-        # log rotator has written something in it.
-        lines = self.readfile(file)
-        self.logger.info("[{0}] - un-watching logfile {1}".format(fid, file.name))
-        del self.files_map[fid]
-        if lines:
-            self.callback(file.name, lines)
-
-    @staticmethod
-    def get_file_id(st):
-        return "%xg%x" % (st.st_dev, st.st_ino)
-
-    def close(self):
-        for id, file in self.files_map.iteritems():
-            file.close()
-        self.files_map.clear()
-
-
-def run_worker(configfile, args):
-    logger = logging.getLogger('beaver')
-    logger.info("Logging using the {0} transport".format(args.transport))
-
-    if args.transport == 'rabbitmq':
-        import beaver.rabbitmq_transport
-        transport = beaver.rabbitmq_transport.RabbitmqTransport(configfile)
-    elif args.transport == 'redis':
-        import beaver.redis_transport
-        transport = beaver.redis_transport.RedisTransport(configfile)
-    elif args.transport == 'stdout':
-        import beaver.stdout_transport
-        transport = beaver.stdout_transport.StdoutTransport(configfile)
-    elif args.transport == 'udp':
-        import beaver.udp_transport
-        transport = beaver.udp_transport.UdpTransport(configfile)
-    elif args.transport == 'zmq':
-        import beaver.zmq_transport
-        transport = beaver.zmq_transport.ZmqTransport(configfile, args)
-    else:
-        raise Exception('Invalid transport {0}'.format(args.transport))
-
-    try:
-        logger.info("Starting worker...")
-        l = Worker(configfile, args, transport.callback)
-        logger.info("Working...")
-        l.loop()
-    except TransportException, e:
-        raise TransportException(e.message)
-    except KeyboardInterrupt:
-        logger.info("Shutting down. Please wait.")
-        transport.interrupt()
-        logger.info("Shutdown complete.")
-        sys.exit(0)
-    except Exception:
-        import traceback
-        exception_list = traceback.format_stack()
-        exception_list = exception_list[:-2]
-        exception_list.extend(traceback.format_tb(sys.exc_info()[2]))
-        exception_list.extend(traceback.format_exception_only(sys.exc_info()[0], sys.exc_info()[1]))
-        exception_str = "Traceback (most recent call last):\n"
-        exception_str += "".join(exception_list)
-        exception_str = exception_str[:-1]
-
-        logger.info("Unhandled Exception:")
-        logger.info(exception_str)
-
-        transport.unhandled()
-        sys.exit(1)

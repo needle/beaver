@@ -1,5 +1,4 @@
 import datetime
-import os
 import socket
 
 import beaver.transport
@@ -7,16 +6,16 @@ import beaver.transport
 
 class UdpTransport(beaver.transport.Transport):
 
-    def __init__(self, configfile):
-        super(UdpTransport, self).__init__(configfile)
+    def __init__(self, beaver_config, file_config, logger=None):
+        super(UdpTransport, self).__init__(beaver_config, file_config, logger=logger)
 
-        self.sock = socket.socket(socket.AF_INET,  # Internet
+        self._sock = socket.socket(socket.AF_INET,  # Internet
             socket.SOCK_DGRAM)  # UDP
-        self.udp_host = os.environ.get("UDP_HOST", "127.0.0.1")
-        self.udp_port = int(os.environ.get("UDP_PORT", 9999))
+        self._address = (beaver_config.get('udp_host'), int(beaver_config.get('udp_port')))
 
     def callback(self, filename, lines):
         timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
         for line in lines:
             formatted = self.format(filename, timestamp, line)
-            self.sock.sendto(formatted, (self.udp_host, self.udp_port))
+            self._sock.sendto(formatted, self._address)

@@ -1,5 +1,4 @@
 import datetime
-import os
 import zmq
 
 import beaver.transport
@@ -7,28 +6,28 @@ import beaver.transport
 
 class ZmqTransport(beaver.transport.Transport):
 
-    def __init__(self, configfile, args):
-        super(ZmqTransport, self).__init__(configfile)
+    def __init__(self, beaver_config, file_config, logger=None):
+        super(ZmqTransport, self).__init__(beaver_config, file_config, logger=logger)
 
-        zeromq_address = os.environ.get("ZEROMQ_ADDRESS", "tcp://localhost:2120")
-        self.zeromq_bind = (args.mode == "bind")
+        zeromq_address = beaver_config.get('zeromq_address')
 
-        self.ctx = zmq.Context()
-        self.pub = self.ctx.socket(zmq.PUSH)
+        self._ctx = zmq.Context()
+        self._pub = self._ctx.socket(zmq.PUSH)
 
-        if self.zeromq_bind:
-            self.pub.bind(zeromq_address)
+        if (beaver_config.get('mode') == "bind"):
+            self._pub.bind(zeromq_address)
         else:
-            self.pub.connect(zeromq_address)
+            self._pub.connect(zeromq_address)
 
     def callback(self, filename, lines):
         timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
         for line in lines:
-            self.pub.send(self.format(filename, timestamp, line))
+            self._pub.send(self.format(filename, timestamp, line))
 
     def interrupt(self):
-        self.pub.close()
-        self.ctx.term()
+        self._pub.close()
+        self._ctx.term()
 
     def unhandled(self):
         return True

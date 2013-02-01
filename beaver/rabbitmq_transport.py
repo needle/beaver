@@ -1,4 +1,3 @@
-import os
 import datetime
 import pika
 
@@ -8,62 +7,53 @@ from beaver.transport import TransportException
 
 class RabbitmqTransport(beaver.transport.Transport):
 
-    def __init__(self, configfile):
-        super(RabbitmqTransport, self).__init__(configfile)
+    def __init__(self, beaver_config, file_config, logger=None):
+        super(RabbitmqTransport, self).__init__(beaver_config, file_config, logger=logger)
 
-        # Create our connection object
-        rabbitmq_address = os.environ.get("RABBITMQ_HOST", "localhost")
-        rabbitmq_port = os.environ.get("RABBITMQ_PORT", 5672)
-        rabbitmq_vhost = os.environ.get("RABBITMQ_VHOST", "/")
-        rabbitmq_user = os.environ.get("RABBITMQ_USERNAME", 'guest')
-        rabbitmq_pass = os.environ.get("RABBITMQ_PASSWORD", 'guest')
-        rabbitmq_queue = os.environ.get("RABBITMQ_QUEUE", 'indexer-queue')
-        rabbitmq_exchange_type = os.environ.get("RABBITMQ_EXCHANGE_TYPE", 'direct')
-        rabbitmq_exchange_durable = bool(os.environ.get("RABBITMQ_EXCHANGE_DURABLE", 0))
-        rabbitmq_queue_durable = bool(os.environ.get("RABBITMQ_QUEUE_DURABLE", 0))
-        self.rabbitmq_key = os.environ.get("RABBITMQ_KEY", 'logstash-key')
-        self.rabbitmq_exchange = os.environ.get("RABBITMQ_EXCHANGE", 'logstash-exchange')
+        self._rabbitmq_key = beaver_config.get('rabbitmq_key')
+        self._rabbitmq_exchange = beaver_config.get('rabbitmq_exchange')
 
         # Setup RabbitMQ connection
         credentials = pika.PlainCredentials(
-            rabbitmq_user,
-            rabbitmq_pass
+            beaver_config.get('rabbitmq_username'),
+            beaver_config.get('rabbitmq_password')
         )
         parameters = pika.connection.ConnectionParameters(
             credentials=credentials,
-            host=rabbitmq_address,
-            port=rabbitmq_port,
-            virtual_host=rabbitmq_vhost
+            host=beaver_config.get('rabbitmq_host'),
+            port=int(beaver_config.get('rabbitmq_port')),
+            virtual_host=beaver_config.get('rabbitmq_vhost')
         )
-        self.connection = pika.adapters.BlockingConnection(parameters)
-        self.channel = self.connection.channel()
+        self._connection = pika.adapters.BlockingConnection(parameters)
+        self._channel = self._connection.channel()
 
         # Declare RabbitMQ queue and bindings
-        self.channel.queue_declare(
-            queue=rabbitmq_queue,
-            durable=rabbitmq_queue_durable
+        self._channel.queue_declare(
+	    queue=beaver_config.get('rabbitmq_queue'),
+	    durable=bool(beaver_config.get('rabbitmq_queue_durable'))
+	)
+        self._channel.exchange_declare(
+            exchange=self._rabbitmq_exchange,
+            exchange_type=beaver_config.get('rabbitmq_exchange_type'),
+            durable=bool(beaver_config.get('rabbitmq_exchange_durable'))
         )
-        self.channel.exchange_declare(
-            exchange=self.rabbitmq_exchange,
-            exchange_type=rabbitmq_exchange_type,
-            durable=rabbitmq_exchange_durable
-        )
-        self.channel.queue_bind(
-            exchange=self.rabbitmq_exchange,
-            queue=rabbitmq_queue,
-            routing_key=self.rabbitmq_key
+        self._channel.queue_bind(
+            exchange=self._rabbitmq_exchange,
+            queue=beaver_config.get('rabbitmq_queue'),
+            routing_key=self._rabbitmq_key
         )
 
     def callback(self, filename, lines):
         timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
         for line in lines:
             try:
                 import warnings
                 with warnings.catch_warnings():
                     warnings.simplefilter("error")
-                    self.channel.basic_publish(
-                        exchange=self.rabbitmq_exchange,
-                        routing_key=self.rabbitmq_key,
+                    self._channel.basic_publish(
+                        exchange=self._rabbitmq_exchange,
+                        routing_key=self._rabbitmq_key,
                         body=self.format(filename, timestamp, line),
                         properties=pika.BasicProperties(
                             content_type="text/json",
@@ -79,8 +69,8 @@ class RabbitmqTransport(beaver.transport.Transport):
                     raise TransportException("Unspecified exception encountered")  # TRAP ALL THE THINGS!
 
     def interrupt(self):
-        if self.connection:
-            self.connection.close()
+        if self._connection:
+            self._connection.close()
 
     def unhandled(self):
         return True
