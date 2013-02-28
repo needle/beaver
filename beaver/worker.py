@@ -102,7 +102,7 @@ class Worker(object):
             if async:
                 return
 
-            self._logger.debug("Iteration took {0}".format(time.time() - t))
+            self._logger.debug("Iteration took {0:.6f}".format(time.time() - t))
             time.sleep(interval)
 
     def readfile(self, fid, file):
@@ -127,6 +127,7 @@ class Worker(object):
                 globbed = [os.path.realpath(filename) for filename in eglob(name)]
                 files.extend(globbed)
                 self._file_config.addglob(name, globbed)
+                self._callback(("addglob", (name, globbed)))
         else:
             for name in self.listdir():
                 files.append(os.path.realpath(os.path.join(self._folder, name)))

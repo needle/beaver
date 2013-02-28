@@ -21,7 +21,7 @@ From Github::
 
 From PyPI::
 
-    pip install beaver==22
+    pip install beaver==24
 
 Usage
 =====
@@ -29,9 +29,9 @@ Usage
 usage::
 
     beaver [-h] [-c CONFIG] [-d] [-D] [-f FILES [FILES ...]]
-           [-F {json,msgpack,string}] [-H HOSTNAME] [-m {bind,connect}]
-           [-o OUTPUT] [-p PATH] [-P PID]
-           [-t {rabbitmq,redis,stdout,zmq,udp}] [-v] [--fqdn]
+            [-F {json,msgpack,string,raw}] [-H HOSTNAME] [-m {bind,connect}]
+            [-l OUTPUT] [-p PATH] [-P PID]
+            [-t {rabbitmq,redis,stdout,zmq,udp}] [-v] [--fqdn]
 
 optional arguments::
 
@@ -43,13 +43,13 @@ optional arguments::
     -f FILES [FILES ...], --files FILES [FILES ...]
                           space-separated filelist to watch, can include globs
                           (*.log). Overrides --path argument
-    -F {json,msgpack,string}, --format {json,msgpack,string}
+    -F {json,msgpack,string,raw}, --format {json,msgpack,string,raw}
                           format to use when sending to transport
     -H HOSTNAME, --hostname HOSTNAME
                           manual hostname override for source_host
     -m {bind,connect}, --mode {bind,connect}
                           bind or connect mode
-    -o OUTPUT, --output OUTPUT
+    -l OUTPUT, --logfile OUTPUT, -o OUTPUT, --output OUTPUT
                           file to pipe output to (in addition to stdout)
     -p PATH, --path PATH  path to log files
     -P PID, --pid PID     path to pid file
@@ -78,7 +78,7 @@ Beaver can optionally get data from a ``configfile`` using the ``-c`` flag. This
 * rabbitmq_username: Default ``guest``
 * rabbitmq_password: Default ``guest``
 * rabbitmq_queue: Default ``logstash-queue``.
-* rabbitmq_exchange: Default ``direct``.
+* rabbitmq_exchange_type: Default ``direct``.
 * rabbitmq_exchange_durable: Default ``0``.
 * rabbitmq_key: Default ``logstash-key``.
 * rabbitmq_exchange: Default ``logstash-exchange``.
@@ -87,6 +87,7 @@ Beaver can optionally get data from a ``configfile`` using the ``-c`` flag. This
 * udp_host: Default ``127.0.0.1``. UDP Host
 * udp_port: Default ``9999``. UDP Port
 * zeromq_address: Default ``tcp://localhost:2120``. Zeromq URL
+* zeromq_hwm: Default None. Zeromq HighWaterMark socket option
 * zeromq_bind: Default ``bind``. Whether to bind to zeromq host or simply connect
 
 The following are used for instances when a TransportException is thrown - Transport dependent
@@ -105,7 +106,7 @@ The following configuration keys are for building an SSH Tunnel that can be used
 The following can also be passed via argparse. Argparse will override all options in the configfile, when specified.
 
 * format: Default ``json``. Options ``[ json, msgpack, string ]``. Format to use when sending to transport
-* files: Default ``files``. Space-separated list of files to tail.
+* files: Default ``files``. Space-separated list of files to tail. (Comma separated if specified in the config file)
 * path: Default ``/var/log``. Path glob to tail.
 * transport: Default ``stdout``. Transport to use when log changes are detected
 * fqdn: Default ``False``. Whether to use the machine's FQDN in transport output

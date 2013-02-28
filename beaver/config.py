@@ -31,6 +31,7 @@ class BeaverConfig():
             'udp_host': os.environ.get('UDP_HOST', '127.0.0.1'),
             'udp_port': os.environ.get('UDP_PORT', '9999'),
             'zeromq_address': os.environ.get('ZEROMQ_ADDRESS', 'tcp://localhost:2120'),
+            'zeromq_hwm': os.environ.get('ZEROMQ_HWM', ''),
 
             # exponential backoff
             'respawn_delay': '3',
@@ -169,16 +170,34 @@ class BeaverConfig():
 
         # HACK: Python 2.6 ConfigParser does not properly
         #       handle non-string values
-        for k in config:
-            if config[k] == '':
-                config[k] = None
+        for key in config:
+            if config[key] == '':
+                config[key] = None
 
-        config['debug'] = bool(config['debug'])
-        config['daemonize'] = bool(config['daemonize'])
-        config['fqdn'] = bool(config['fqdn'])
+        require_bool = ['debug', 'daemonize', 'fqdn', 'rabbitmq_exchange_durable']
 
-        config['max_queue_size'] = int(config['max_queue_size'])
-        config['update_file_mapping_time'] = int(config['update_file_mapping_time'])
+        for key in require_bool:
+            config[key] = bool(config[key])
+
+        require_int = [
+            'max_failure',
+            'max_queue_size',
+            'rabbitmq_port',
+            'respawn_delay',
+            'udp_port',
+            'zeromq_hwm',
+        ]
+        for key in require_int:
+            if config[key] is not None:
+                config[key] = int(config[key])
+
+        require_float = [
+            'update_file_mapping_time',
+        ]
+
+        for key in require_float:
+            if config[key] is not None:
+                config[key] = float(config[key])
 
         if config['files'] is not None and type(config['files']) == str:
             config['files'] = config['files'].split(',')
@@ -188,7 +207,7 @@ class BeaverConfig():
             raise LookupError('{0} does not exist'.format(config['path']))
 
         if config.get('hostname') is None:
-            if bool(config.get('fqdn')) == True:
+            if config.get('fqdn') == True:
                 config['hostname'] = socket.getfqdn()
             else:
                 config['hostname'] = socket.gethostname()
