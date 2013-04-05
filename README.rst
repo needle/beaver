@@ -21,7 +21,7 @@ From Github::
 
 From PyPI::
 
-    pip install beaver==24
+    pip install beaver==28
 
 Usage
 =====
@@ -29,9 +29,9 @@ Usage
 usage::
 
     beaver [-h] [-c CONFIG] [-d] [-D] [-f FILES [FILES ...]]
-            [-F {json,msgpack,string,raw}] [-H HOSTNAME] [-m {bind,connect}]
-            [-l OUTPUT] [-p PATH] [-P PID]
-            [-t {rabbitmq,redis,stdout,zmq,udp}] [-v] [--fqdn]
+           [-F {json,msgpack,raw,rawjson,string}] [-H HOSTNAME] [-m {bind,connect}]
+           [-l OUTPUT] [-p PATH] [-P PID]
+           [-t {mqtt,rabbitmq,redis,sqs,stdout,udp,zmq}] [-v] [--fqdn]
 
 optional arguments::
 
@@ -43,7 +43,7 @@ optional arguments::
     -f FILES [FILES ...], --files FILES [FILES ...]
                           space-separated filelist to watch, can include globs
                           (*.log). Overrides --path argument
-    -F {json,msgpack,string,raw}, --format {json,msgpack,string,raw}
+    -F {json,msgpack,raw,rawjson,string}, --format {json,msgpack,raw,rawjson,string}
                           format to use when sending to transport
     -H HOSTNAME, --hostname HOSTNAME
                           manual hostname override for source_host
@@ -53,7 +53,7 @@ optional arguments::
                           file to pipe output to (in addition to stdout)
     -p PATH, --path PATH  path to log files
     -P PID, --pid PID     path to pid file
-    -t {rabbitmq,redis,stdout,zmq,udp}, --transport {rabbitmq,redis,stdout,zmq,udp}
+    -t {mqtt,rabbitmq,redis,stdout,udp,zmq}, --transport {mqtt,rabbitmq,redis,sqs,stdout,udp,zmq}
                           log transport method
     -v, --version         output version and quit
     --fqdn                use the machine's FQDN for source_host
@@ -61,7 +61,7 @@ optional arguments::
 Background
 ==========
 
-Beaver provides an lightweight method for shipping local log files to Logstash. It does this using either redis, stdin, zeromq as the transport. This means you'll need a redis, stdin, zeromq input somewhere down the road to get the events.
+Beaver provides an lightweight method for shipping local log files to Logstash. It does this using redis, zeromq, udp, rabbit or stdout as the transport. This means you'll need a redis, zeromq, udp, amqp or stdin input somewhere down the road to get the events.
 
 Events are sent in logstash's ``json_event`` format. Options can also be set as environment variables.
 
@@ -72,8 +72,13 @@ Configuration File Options
 
 Beaver can optionally get data from a ``configfile`` using the ``-c`` flag. This file is in ``ini`` format. Global configuration will be under the ``beaver`` stanza. The following are global beaver configuration keys with their respective meanings:
 
-* rabbitmq_host: Defaults ``localhost``. Host for RabbitMQ.
-* rabbitmq_port: Defaults ``5672``. Port for RabbitMQ.
+* mqtt_host: Default ``localhost``. Host for mosquitto
+* mqtt_port: Default ``1883``. Port for mosquitto
+* mqtt_clientid: Default ``mosquitto``. Mosquitto client id
+* mqtt_keepalive: Default ``60``. mqtt keepalive ping
+* mqtt_topic: Default ``/logstash``. Topic to publish to
+* rabbitmq_host: Defaults ``localhost``. Host for RabbitMQ
+* rabbitmq_port: Defaults ``5672``. Port for RabbitMQ
 * rabbitmq_vhost: Default ``/``
 * rabbitmq_username: Default ``guest``
 * rabbitmq_password: Default ``guest``
@@ -84,6 +89,10 @@ Beaver can optionally get data from a ``configfile`` using the ``-c`` flag. This
 * rabbitmq_exchange: Default ``logstash-exchange``.
 * redis_url: Default ``redis://localhost:6379/0``. Redis URL
 * redis_namespace: Default ``logstash:beaver``. Redis key namespace
+* sqs_aws_access_key: Can be left blank to use IAM Roles or AWS_ACCESS_KEY_ID environment variable (see: https://github.com/boto/boto#getting-started-with-boto)
+* sqs_aws_secret_key: Can be left blank to use IAM Roles or AWS_SECRET_ACCESS_KEY environment variable (see: https://github.com/boto/boto#getting-started-with-boto)
+* sqs_aws_region: Default ``us-east-1``. AWS Region
+* sqs_aws_queue: SQS queue (must exist)
 * udp_host: Default ``127.0.0.1``. UDP Host
 * udp_port: Default ``9999``. UDP Port
 * zeromq_address: Default ``tcp://localhost:2120``. Zeromq URL
@@ -94,6 +103,10 @@ The following are used for instances when a TransportException is thrown - Trans
 
 * respawn_delay: Default ``3``. Initial respawn delay for exponential backoff
 * max_failure: Default ``7``. Max failures before exponential backoff terminates
+
+The following configuration keys are for SinceDB support. Specifying these will enable saving the current line number in an sqlite database. This is useful for cases where you may be restarting the beaver process, such as during a logrotate.
+
+* sincedb_path: Default ``None``. Full path to an ``sqlite3`` database. Will be created at this path if it does not exist. Beaver process must have read and write access
 
 The following configuration keys are for building an SSH Tunnel that can be used to proxy from the current host to a desired server. This proxy is torn down when Beaver halts in all cases.
 
@@ -275,14 +288,83 @@ Example 11: UDP transport::
     # From the commandline
     beaver -c /etc/beaver.conf -t udp
 
+Example 12: SQS Transport::
+
+    # /etc/beaver.conf
+    [beaver]
+    sqs_aws_region: us-east-1
+    sqs_aws_queue: logstash-input
+    sqs_aws_access_key: <access_key>
+    sqs_aws_secret_access_key: <secret_key>
+
+    # logstash indexer config:
+    input {
+      sqs_fillz {
+        queue => "logstash-input"
+        type => "shipper-input"
+        format => "json_event"
+        access_key => "<access_key>"
+        secret_key => "<secret_key>"
+      }
+    }
+    output { stdout { debug => true } }
+
+    # From the commandline
+    beaver -c /etc/beaver.conf -t sqs
+
+Example 13: [Raw Json Support](http://blog.pkhamre.com/2012/08/23/logging-to-logstash-json-format-in-nginx/::
+
+    beaver --format rawjson
+
+Example 14: Mqtt transport using Mosquitto::
+
+    # /etc/beaver.conf
+    [beaver]
+    mqtt_client_id: 'beaver_client'
+    mqtt_topic: '/logstash'
+    mqtt_host: '127.0.0.1'
+    mqtt_port: '1318'
+    mqtt_keepalive: '60'
+
+    # logstash indexer config:
+    input {
+      mqtt {
+        host => '127.0.0.1'
+        data_type => 'list'
+        key => 'app:unmappable'
+        type => 'app:unmappable'
+      }
+    }
+    output { stdout { debug => true } }
+
+    # From the commandline
+    beaver -c /etc/beaver.conf -f /var/log/unmappable.log -t redis
+
+Example 15: Sincedb support using and sqlite3 db
+
+Note that this will require R/W permissions on the file at sincedb path, as Beaver will store the current line for a given filename/file id.::
+
+    # /etc/beaver.conf
+    [beaver]
+    sincedb_path: /etc/beaver/since.db
+
+    [/var/log/syslog]
+    type: syslog
+    tags: sys,main
+    sincedb_write_interval: 3 ; time in seconds
+
+    # From the commandline
+    beaver -c /etc/beaver.conf -t redis
+
+
 Todo
 ====
 
 * More documentation
-* Use python threading + subprocess in order to support usage of ``yield`` across all operating systems
-* ~~Fix usage on non-linux platforms - file.readline() does not work as expected on OS X. See above for potential solution~~
+* <del>Use python threading + subprocess in order to support usage of ``yield`` across all operating systems</del>
+* <del>Fix usage on non-linux platforms - file.readline() does not work as expected on OS X. See above for potential solution</del>
 * More transports
-* ~~Ability to specify files, tags, and other metadata within a configuration file~~
+* <del>Ability to specify files, tags, and other metadata within a configuration file</del>
 
 Caveats
 =======

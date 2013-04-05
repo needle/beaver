@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import ConfigParser
 import logging
 import os
@@ -14,6 +15,11 @@ class BeaverConfig():
         self._logger.debug('Processing beaver portion of config file %s' % args.config)
 
         self._beaver_defaults = {
+            'mqtt_clientid': 'mosquitto',
+            'mqtt_host': 'localhost',
+            'mqtt_port': '1883',
+            'mqtt_topic': '/logstash',
+            'mqtt_keepalive': '60',
             'rabbitmq_host': os.environ.get('RABBITMQ_HOST', 'localhost'),
             'rabbitmq_port': os.environ.get('RABBITMQ_PORT', '5672'),
             'rabbitmq_vhost': os.environ.get('RABBITMQ_VHOST', '/'),
@@ -28,9 +34,14 @@ class BeaverConfig():
             'redis_url': os.environ.get('REDIS_URL', 'redis://localhost:6379/0'),
             'redis_namespace': os.environ.get('REDIS_NAMESPACE', 'logstash:beaver'),
             'redis_password': '',
+            'sqs_aws_access_key': '',
+            'sqs_aws_secret_key': '',
+            'sqs_aws_region': 'us-east-1',
+            'sqs_aws_queue': '',
             'udp_host': os.environ.get('UDP_HOST', '127.0.0.1'),
             'udp_port': os.environ.get('UDP_PORT', '9999'),
             'zeromq_address': os.environ.get('ZEROMQ_ADDRESS', 'tcp://localhost:2120'),
+            'zeromq_pattern': "push",
             'zeromq_hwm': os.environ.get('ZEROMQ_HWM', ''),
 
             # exponential backoff
@@ -43,12 +54,22 @@ class BeaverConfig():
             # time in seconds before updating the file mapping
             'update_file_mapping_time': '10',
 
+            # time in seconds from last command sent before a queue kills itself
+            'queue_timeout': '60',
+
+            # time in seconds to wait on queue.get() block before raising Queue.Empty exception
+            'wait_timeout': '5',
+
+            # path to sincedb sqlite db
+            'sincedb_path': '',
+
             # ssh tunnel support
             'ssh_key_file': '',
             'ssh_tunnel': '',
             'ssh_tunnel_port': '',
             'ssh_remote_host': '',
             'ssh_remote_port': '',
+            'subprocess_poll_sleep': '1',
 
             # the following can be passed via argparse
             'zeromq_bind': os.environ.get('BEAVER_MODE', 'bind' if os.environ.get('BIND', False) else 'connect'),
@@ -104,26 +125,26 @@ class BeaverConfig():
 
     def _check_for_deprecated_usage(self):
         env_vars = [
-          'RABBITMQ_HOST',
-          'RABBITMQ_PORT',
-          'RABBITMQ_VHOST',
-          'RABBITMQ_USERNAME',
-          'RABBITMQ_PASSWORD',
-          'RABBITMQ_QUEUE',
-          'RABBITMQ_EXCHANGE_TYPE',
-          'RABBITMQ_EXCHANGE_DURABLE',
-          'RABBITMQ_KEY',
-          'RABBITMQ_EXCHANGE',
-          'REDIS_URL',
-          'REDIS_NAMESPACE',
-          'UDP_HOST',
-          'UDP_PORT',
-          'ZEROMQ_ADDRESS',
-          'BEAVER_FILES',
-          'BEAVER_FORMAT',
-          'BEAVER_MODE',
-          'BEAVER_PATH',
-          'BEAVER_TRANSPORT',
+            'RABBITMQ_HOST',
+            'RABBITMQ_PORT',
+            'RABBITMQ_VHOST',
+            'RABBITMQ_USERNAME',
+            'RABBITMQ_PASSWORD',
+            'RABBITMQ_QUEUE',
+            'RABBITMQ_EXCHANGE_TYPE',
+            'RABBITMQ_EXCHANGE_DURABLE',
+            'RABBITMQ_KEY',
+            'RABBITMQ_EXCHANGE',
+            'REDIS_URL',
+            'REDIS_NAMESPACE',
+            'UDP_HOST',
+            'UDP_PORT',
+            'ZEROMQ_ADDRESS',
+            'BEAVER_FILES',
+            'BEAVER_FORMAT',
+            'BEAVER_MODE',
+            'BEAVER_PATH',
+            'BEAVER_TRANSPORT',
         ]
 
         deprecated_env_var_usage = []
@@ -177,14 +198,17 @@ class BeaverConfig():
         require_bool = ['debug', 'daemonize', 'fqdn', 'rabbitmq_exchange_durable']
 
         for key in require_bool:
-            config[key] = bool(config[key])
+            config[key] = bool(int(config[key]))
 
         require_int = [
             'max_failure',
             'max_queue_size',
+            'queue_timeout',
             'rabbitmq_port',
             'respawn_delay',
+            'subprocess_poll_sleep',
             'udp_port',
+            'wait_timeout',
             'zeromq_hwm',
         ]
         for key in require_int:
@@ -258,12 +282,18 @@ class FileConfig():
             'discover_interval': '15',
             'exclude': '',
             'format': '',
+
+            # throw out empty lines instead of shipping them
+            'ignore_empty': '0',
+
             'message_format': '',
-            'sincedb_path': '',
             'sincedb_write_interval': '15',
             'stat_interval': '1',
+            'start_position': 'end',
             'tags': '',
-            'type': ''
+            'tail_lines': '0',
+            'type': '',
+            'encoding': 'utf_8',
         }
 
         self._configfile = args.config
@@ -335,6 +365,9 @@ class FileConfig():
         except:
             config['type'] = "file"
 
+        config['ignore_empty'] = bool(int(config['ignore_empty']))
+        config['sincedb_write_interval'] = int(config['sincedb_write_interval'])
+
         return config
 
     def _parse(self):
@@ -351,6 +384,8 @@ class FileConfig():
             if not globs:
                 self._logger.debug('Skipping glob due to no files found: %s' % filename)
                 continue
+
+            config = self._gen_config(config)
 
             for globbed_file in globs:
                 files[os.path.realpath(globbed_file)] = config

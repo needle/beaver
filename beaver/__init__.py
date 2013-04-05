@@ -1,1 +1,2 @@
-__version__ = '24'
+# -*- coding: utf-8 -*-
+__version__ = '28'

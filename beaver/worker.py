@@ -1,9 +1,15 @@
+# -*- coding: utf-8 -*-
+import datetime
 import errno
+import gzip
+import io
 import os
+import sqlite3
 import stat
 import time
 
-from beaver.utils import REOPEN_FILES, eglob
+from beaver.utils import IS_GZIPPED_FILE, REOPEN_FILES, eglob
+from beaver.unicode_dammit import ENCODINGS
 
 
 class Worker(object):
@@ -16,11 +22,11 @@ class Worker(object):
     >>> def callback(filename, lines):
     ...     print filename, lines
     ...
-    >>> l = Worker(args, callback, ["log", "txt"], tail_lines=0)
+    >>> l = Worker(args, callback, ["log", "txt"])
     >>> l.loop()
     """
 
-    def __init__(self, beaver_config, file_config, queue_consumer_function, callback, logger=None, tail_lines=0):
+    def __init__(self, beaver_config, file_config, queue_consumer_function, callback, logger=None):
         """Arguments:
 
         (FileConfig) @file_config:
@@ -36,9 +42,6 @@ class Worker(object):
             a function which is called every time a new line in a
             file being watched is found;
             this is called with "filename" and "lines" arguments.
-
-        (int) @tail_lines:
-            read last N lines from files being watched before starting
         """
         self._beaver_config = beaver_config
         self._callback = callback
@@ -48,20 +51,14 @@ class Worker(object):
         self._folder = self._beaver_config.get('path')
         self._logger = logger
         self._proc = None
+        self._sincedb_path = self._beaver_config.get('sincedb_path')
         self._update_time = None
 
         if not callable(self._callback):
             raise RuntimeError("Callback for worker is not callable")
 
         self.update_files()
-        # The first time we run the script we move all file markers at EOF.
-        # In case of files created afterwards we don't do this.
-        for id, file in self._file_map.iteritems():
-            file.seek(os.path.getsize(file.name))  # EOF
-            if tail_lines:
-                lines = self.tail(file.name, tail_lines)
-                if lines:
-                    self._callback(("callback", (file.name, lines)))
+        self.seek_to_end()
 
     def __del__(self):
         """Closes all files"""
@@ -69,8 +66,8 @@ class Worker(object):
 
     def close(self):
         """Closes all currently open file pointers"""
-        for id, file in self._file_map.iteritems():
-            file.close()
+        for id, data in self._file_map.iteritems():
+            data['file'].close()
         self._file_map.clear()
 
     def listdir(self):
@@ -85,7 +82,7 @@ class Worker(object):
         """Start the loop.
         If async is True make one loop then return.
         """
-        while 1:
+        while True:
             t = time.time()
             if not (self._proc and self._proc.is_alive()):
                 self._proc = self._create_queue_consumer()
@@ -93,12 +90,12 @@ class Worker(object):
             if int(time.time()) - self._update_time > self._beaver_config.get('update_file_mapping_time'):
                 self.update_files()
 
-            for fid, file in list(self._file_map.iteritems()):
+            for fid, data in self._file_map.iteritems():
                 try:
-                    self.readfile(fid, file)
+                    self.readfile(fid, data['file'])
                 except IOError, e:
                     if e.errno == errno.ESTALE:
-                        self.unwatch(file, fid)
+                        self.unwatch(data['file'], fid)
             if async:
                 return
 
@@ -108,9 +105,167 @@ class Worker(object):
     def readfile(self, fid, file):
         """Read lines from a file and performs a callback against them"""
         lines = file.readlines(4096)
+        line_count = 0
         while lines:
-            self._callback(("callback", (file.name, lines)))
+            if self._sincedb_path:
+                current_line_count = len(lines)
+                if not self._sincedb_update_position(file, fid=fid, lines=current_line_count):
+                    line_count += current_line_count
+
+            self._callback(("callback", {
+                'filename': file.name,
+                'lines': lines,
+                'timestamp': datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            }))
+
             lines = file.readlines(4096)
+
+        if line_count > 0:
+            self._sincedb_update_position(file, fid=fid, lines=line_count, force_update=True)
+
+    def seek_to_end(self):
+        # The first time we run the script we move all file markers at EOF.
+        # In case of files created afterwards we don't do this.
+        for fid, data in self._file_map.iteritems():
+            start_position = self._file_config.get('start_position', data['file'].name)
+
+            if self._sincedb_path:
+                sincedb_start_position = self._sincedb_start_position(data['file'], fid=fid)
+                if sincedb_start_position:
+                    start_position = sincedb_start_position
+
+            if start_position == "beginning":
+                continue
+
+            line_count = 0
+            try:
+                if start_position == "end":
+                    self._logger.debug("[{0}] - getting end position for {1}".format(fid, data['file'].name))
+                    for encoding in ENCODINGS:
+                        line_count = 0
+                        try:
+                            while data['file'].next():
+                                line_count += 1
+                            break
+                        except UnicodeDecodeError:
+                            line_count = 0
+                            data['file'] = self.open(data['file'].name, encoding=encoding)
+                            data['encoding'] = encoding
+
+                else:
+                    self._logger.debug("[{0}] - going to start position {1} for {2}".format(fid, start_position, data['file'].name))
+                    start_position = int(start_position)
+                    while line_count <= start_position:
+                        data['file'].next()
+                        if line_count < start_position:
+                            line_count += 1
+            except StopIteration:
+                pass
+
+            current_position = data['file'].tell()
+            self._logger.debug("[{0}] - line count {1} for {2}".format(fid, line_count, data['file'].name))
+            self._sincedb_update_position(data['file'], fid=fid, lines=line_count, force_update=True)
+
+            tail_lines = self._file_config.get('tail_lines', data['file'].name)
+            tail_lines = int(tail_lines)
+            if tail_lines:
+                encoding = data['encoding']
+
+                lines = self.tail(data['file'].name, encoding=encoding, window=tail_lines, position=current_position)
+                if lines:
+                    self._callback(("callback", {
+                        'filename': data['file'].name,
+                        'lines': lines,
+                        'timestamp': datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                    }))
+
+    def _sincedb_init(self):
+        """Initializes the sincedb schema in an sqlite db"""
+        if not self._sincedb_path:
+            return
+
+        if not os.path.exists(self._sincedb_path):
+            self._logger.debug('Initializing sincedb sqlite schema')
+            conn = sqlite3.connect(self._sincedb_path, isolation_level=None)
+            conn.execute("""
+            create table sincedb (
+                fid      text primary key,
+                filename text,
+                position integer default 1
+            );
+            """)
+            conn.close()
+
+    def _sincedb_update_position(self, file, fid=None, lines=0, force_update=False):
+        """Retrieves the starting position from the sincedb sql db for a given file
+        Returns a boolean representing whether or not it updated the record
+        """
+        if not self._sincedb_path:
+            return False
+
+        if not fid:
+            fid = self.get_file_id(os.stat(file.name))
+
+        current_time = int(time.time())
+        update_time = self._file_map[fid]['update_time']
+        if not force_update:
+            sincedb_write_interval = self._file_config.get('sincedb_write_interval', file.name)
+            if update_time and current_time - update_time <= sincedb_write_interval:
+                return False
+
+            if lines == 0:
+                return False
+
+        self._sincedb_init()
+
+        old_count = self._file_map[fid]['line']
+        self._file_map[fid]['update_time'] = current_time
+        self._file_map[fid]['line'] = old_count + lines
+        lines = self._file_map[fid]['line']
+
+        self._logger.debug("[{0}] - updating sincedb for logfile {1} from {2} to {3}".format(fid, file.name, old_count, lines))
+
+        conn = sqlite3.connect(self._sincedb_path, isolation_level=None)
+        cursor = conn.cursor()
+        query = "insert or ignore into sincedb (fid, filename) values (:fid, :filename);"
+        cursor.execute(query, {
+            'fid': fid,
+            'filename': file.name
+        })
+
+        query = "update sincedb set position = :position where fid = :fid and filename = :filename"
+        cursor.execute(query, {
+            'fid': fid,
+            'filename': file.name,
+            'position': int(lines),
+        })
+        conn.close()
+
+        return True
+
+    def _sincedb_start_position(self, file, fid=None):
+        """Retrieves the starting position from the sincedb sql db
+        for a given file
+        """
+        if not self._sincedb_path:
+            return None
+
+        if not fid:
+            fid = self.get_file_id(os.stat(file.name))
+
+        self._sincedb_init()
+        conn = sqlite3.connect(self._sincedb_path, isolation_level=None)
+        cursor = conn.cursor()
+        cursor.execute("select position from sincedb where fid = :fid and filename = :filename", {
+            'fid': fid,
+            'filename': file.name
+        })
+
+        start_position = None
+        for row in cursor.fetchall():
+            start_position, = row
+
+        return start_position
 
     def update_files(self):
         """Ensures all files are properly loaded.
@@ -145,31 +300,31 @@ class Worker(object):
                 ls.append((fid, absname))
 
         # check existent files
-        for fid, file in list(self._file_map.iteritems()):
+        for fid, data in self._file_map.iteritems():
             try:
-                st = os.stat(file.name)
+                st = os.stat(data['file'].name)
             except EnvironmentError, err:
                 if err.errno == errno.ENOENT:
-                    self.unwatch(file, fid)
+                    self.unwatch(data['file'], fid)
                 else:
                     raise
             else:
                 if fid != self.get_file_id(st):
-                    self._logger.info("[{0}] - file rotated {1}".format(fid, file.name))
-                    self.unwatch(file, fid)
-                    self.watch(file.name)
-                elif file.tell() > st.st_size:
-                    self._logger.info("[{0}] - file truncated {1}".format(fid, file.name))
-                    self.unwatch(file, fid)
-                    self.watch(file.name)
+                    self._logger.info("[{0}] - file rotated {1}".format(fid, data['file'].name))
+                    self.unwatch(data['file'], fid)
+                    self.watch(data['file'].name)
+                elif data['file'].tell() > st.st_size:
+                    self._logger.info("[{0}] - file truncated {1}".format(fid, data['file'].name))
+                    self.unwatch(data['file'], fid)
+                    self.watch(data['file'].name)
                 elif REOPEN_FILES:
-                    self._logger.debug("[{0}] - file reloaded (non-linux) {1}".format(fid, file.name))
-                    position = file.tell()
-                    fname = file.name
-                    file.close()
-                    file = open(fname, "r")
+                    self._logger.debug("[{0}] - file reloaded (non-linux) {1}".format(fid, data['file'].name))
+                    position = data['file'].tell()
+                    fname = data['file'].name
+                    data['file'].close()
+                    file = self.open(fname, encoding=data['encoding'])
                     file.seek(position)
-                    self._file_map[fid] = file
+                    self._file_map[fid]['file'] = file
 
         # add new ones
         for fid, fname in ls:
@@ -192,46 +347,88 @@ class Worker(object):
     def watch(self, fname):
         """Opens a file for log tailing"""
         try:
-            file = open(fname, "r")
+            file = self.open(fname, encoding=self._file_config.get('encoding', fname))
             fid = self.get_file_id(os.stat(fname))
         except EnvironmentError, err:
             if err.errno != errno.ENOENT:
                 raise
         else:
             self._logger.info("[{0}] - watching logfile {1}".format(fid, fname))
-            self._file_map[fid] = file
+            self._file_map[fid] = {
+                'encoding': self._file_config.get('encoding', fname),
+                'file': file,
+                'line': 0,
+                'update_time': None,
+            }
+
+    @classmethod
+    def open(cls, fname, encoding=None):
+        """Opens a file with the appropriate call"""
+        if IS_GZIPPED_FILE.search(fname):
+            file = gzip.open(fname, "rb")
+        else:
+            if encoding:
+                file = io.open(fname, "r", encoding=encoding)
+            else:
+                file = io.open(fname, "r")
+
+        return file
 
     @staticmethod
     def get_file_id(st):
         return "%xg%x" % (st.st_dev, st.st_ino)
 
-    @staticmethod
-    def tail(fname, window):
+    @classmethod
+    def tail(cls, fname, encoding, window, position=None):
         """Read last N lines from file fname."""
-        try:
-            f = open(fname, 'r')
-        except IOError, err:
-            if err.errno == errno.ENOENT:
-                return []
-            else:
+        if window <= 0:
+            raise ValueError('invalid window %r' % window)
+
+        encodings = ENCODINGS
+        if encoding:
+            encodings = [encoding] + ENCODINGS
+
+        for enc in encodings:
+            try:
+                f = cls.open(fname, encoding=enc)
+                return cls.tail_read(f, window, position=position)
+            except IOError, err:
+                if err.errno == errno.ENOENT:
+                    return []
                 raise
-        else:
-            BUFSIZ = 1024
-            f.seek(0, os.SEEK_END)
-            fsize = f.tell()
-            block = -1
-            data = ""
-            exit = False
-            while not exit:
-                step = (block * BUFSIZ)
-                if abs(step) >= fsize:
-                    f.seek(0)
-                    exit = True
-                else:
-                    f.seek(step, os.SEEK_END)
-                data = f.read().strip()
-                if data.count('\n') >= window:
-                    break
-                else:
-                    block -= 1
-            return data.splitlines()[-window:]
+            except UnicodeDecodeError:
+                pass
+
+    @classmethod
+    def tail_read(cls, f, window, position=None):
+        BUFSIZ = 1024
+        # open() was overridden and file was opened in text
+        # mode; read() will return a string instead bytes.
+        encoded = getattr(f, 'encoding', False)
+        CR = '\n' if encoded else b'\n'
+        data = '' if encoded else b''
+        f.seek(0, os.SEEK_END)
+        if position is None:
+            position = f.tell()
+
+        block = -1
+        exit = False
+        read = BUFSIZ
+
+        while not exit:
+            step = (block * BUFSIZ) + position
+            if step < 0:
+                step = 0
+                read = ((block + 1) * BUFSIZ) + position
+                exit = True
+
+            f.seek(step, os.SEEK_SET)
+            newdata = f.read(read)
+
+            data = newdata + data
+            if data.count(CR) > window:
+                break
+            else:
+                block -= 1
+
+        return data.splitlines()[-window:]

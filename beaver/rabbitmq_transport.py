@@ -1,4 +1,4 @@
-import datetime
+# -*- coding: utf-8 -*-
 import pika
 
 import beaver.transport
@@ -43,8 +43,8 @@ class RabbitmqTransport(beaver.transport.Transport):
             routing_key=self._rabbitmq_key
         )
 
-    def callback(self, filename, lines):
-        timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    def callback(self, filename, lines, **kwargs):
+        timestamp = self.get_timestamp(**kwargs)
 
         for line in lines:
             try:
@@ -61,8 +61,10 @@ class RabbitmqTransport(beaver.transport.Transport):
                         )
                     )
             except UserWarning:
+                self._is_valid = False
                 raise TransportException("Connection appears to have been lost")
             except Exception, e:
+                self._is_valid = False
                 try:
                     raise TransportException(e.strerror)
                 except AttributeError:

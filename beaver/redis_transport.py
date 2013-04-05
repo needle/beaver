@@ -1,4 +1,4 @@
-import datetime
+# -*- coding: utf-8 -*-
 import redis
 import time
 import urlparse
@@ -25,14 +25,16 @@ class RedisTransport(beaver.transport.Transport):
             if wait == 20:
                 break
 
-            time.sleep(0.1)
+            time.sleep(1)
             wait += 1
             try:
                 self._redis.ping()
                 break
             except UserWarning:
+                self._is_valid = False
                 raise TransportException("Connection appears to have been lost")
             except Exception, e:
+                self._is_valid = False
                 try:
                     raise TransportException(e.strerror)
                 except AttributeError:
@@ -40,8 +42,8 @@ class RedisTransport(beaver.transport.Transport):
 
         self._pipeline = self._redis.pipeline(transaction=False)
 
-    def callback(self, filename, lines):
-        timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    def callback(self, filename, lines, **kwargs):
+        timestamp = self.get_timestamp(**kwargs)
 
         for line in lines:
             self._pipeline.rpush(

@@ -1,4 +1,6 @@
+# -*- coding: utf-8 -*-
 import os
+import datetime
 
 
 def create_transport(beaver_config, file_config, logger):
@@ -32,6 +34,8 @@ class Transport(object):
         """
         self._current_host = beaver_config.get('hostname')
         self._file_config = file_config
+        self._is_valid = True
+        self._logger = logger
 
         if beaver_config.get('format') == 'msgpack':
             import msgpack
@@ -44,6 +48,23 @@ class Transport(object):
                 try:
                     json = __import__(mod)
                     self._formatter = json.dumps
+                except ImportError:
+                    pass
+                else:
+                    break
+        elif beaver_config.get('format') == 'rawjson':
+            # priority: ujson > simplejson > jsonlib2 > json
+            priority = ['ujson', 'simplejson', 'jsonlib2', 'json']
+            for mod in priority:
+                try:
+                    json = __import__(mod)
+                    def rawjson_formatter(data):
+                        json_data = json.loads(data['@message'])
+                        for field in ['@source', '@type', '@tags', '@source_host', '@source_path']:
+                            if  field in data:
+                                json_data[field] = data[field]
+                        return json.dumps(json_data)
+                    self._formatter = rawjson_formatter
                 except ImportError:
                     pass
                 else:
@@ -61,6 +82,11 @@ class Transport(object):
         """Processes a set of lines for a filename"""
         return True
 
+    def reconnect(self):
+        """Allows reconnection from when a handled
+        TransportException is thrown"""
+        return True
+
     def interrupt(self):
         """Allows keyboard interrupts to be
         handled properly by the transport
@@ -73,6 +99,13 @@ class Transport(object):
         """
         return True
 
+    def get_timestamp(self, **kwargs):
+        timestamp = kwargs.get('timestamp')
+        if not timestamp:
+            timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        return timestamp
+
     def format(self, filename, timestamp, line):
         """Returns a formatted log line"""
         return self._formatter({
@@ -83,11 +116,14 @@ class Transport(object):
             '@timestamp': timestamp,
             '@source_host': self._current_host,
             '@source_path': filename,
-            '@message': line.strip(os.linesep),
+            '@message': line,
         })
 
     def addglob(self, globname, globbed):
         self._file_config.addglob(globname, globbed)
+
+    def valid(self):
+        return self._is_valid
 
 
 class TransportException(Exception):

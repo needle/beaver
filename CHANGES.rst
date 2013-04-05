@@ -1,6 +1,42 @@
 Changelog
 =========
 
+28 (2013-03-05)
+---------------
+
+- BeaverSubprocess is now a new-style class. Fixes ssh_tunneling. [Jose
+  Diaz-Gonzalez]
+
+27 (2013-03-05)
+---------------
+
+- Fix issue where super method was not called in BeaverSshTunnel. [Jose
+  Diaz-Gonzalez]
+
+26 (2013-03-05)
+---------------
+
+- Add optional reconnect support for transports. Refs #93. [Jose Diaz-
+  Gonzalez]
+
+- Add a method for checking the validity of a Transport. Refs #93. [Jose
+  Diaz-Gonzalez]
+
+- Added a configurable subprocess poll sleep. [Jose Diaz-Gonzalez]
+
+- Add a deafult sleep timeout to BeaverSubprocess polling. [Jose Diaz-
+  Gonzalez]
+
+- Use a larger sleep time to get around redis over ssh connection
+  issues. [Jose Diaz-Gonzalez]
+
+25 (2013-03-05)
+---------------
+
+- Use True instead of 1 for while check. [Jose Diaz-Gonzalez]
+
+- Fix orphan child processes. Closes #103. [Jose Diaz-Gonzalez]
+
 24 (2013-02-26)
 ---------------
 
