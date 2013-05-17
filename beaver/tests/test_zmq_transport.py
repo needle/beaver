@@ -2,31 +2,30 @@
 import mock
 import unittest
 
-from beaver.config import BeaverConfig, FileConfig
+from beaver.config import BeaverConfig
 
 try:
-    from beaver.zmq_transport import ZmqTransport
+    from beaver.transport.zmq_transport import ZmqTransport
     skip = False
 except ImportError, e:
-    if e.message == "No module named zmq":
+    if e.message == 'No module named zmq':
         skip = True
 
 
-@unittest.skipIf(skip, "zmq not installed")
+@unittest.skipIf(skip, 'zmq not installed')
 class ZmqTests(unittest.TestCase):
 
     def setUp(self):
-        self.file_config = mock.Mock(spec=FileConfig)
         self.beaver_config = BeaverConfig(mock.Mock(config=None))
 
     def test_pub(self):
         self.beaver_config.set('zeromq_address', 'tcp://localhost:2120')
-        transport = ZmqTransport(self.beaver_config, self.file_config)
+        transport = ZmqTransport(self.beaver_config)
         transport.interrupt()
         #assert not transport.zeromq_bind
 
     def test_bind(self):
         self.beaver_config.set('zeromq_bind', 'bind')
         self.beaver_config.set('zeromq_address', 'tcp://localhost:2120')
-        ZmqTransport(self.beaver_config, self.file_config)
+        ZmqTransport(self.beaver_config)
         #assert transport.zeromq_bind

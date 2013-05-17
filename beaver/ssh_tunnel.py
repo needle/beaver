@@ -4,6 +4,8 @@ import signal
 import subprocess
 import time
 
+from beaver.base_log import BaseLog
+
 
 def create_ssh_tunnel(beaver_config, logger=None):
     """Returns a BeaverSshTunnel object if the current config requires us to"""
@@ -11,13 +13,13 @@ def create_ssh_tunnel(beaver_config, logger=None):
         return None
 
     logger.info("Proxying transport using through local ssh tunnel")
-    return BeaverSshTunnel(beaver_config)
+    return BeaverSshTunnel(beaver_config, logger=logger)
 
 
-class BeaverSubprocess(object):
+class BeaverSubprocess(BaseLog):
     """General purpose subprocess wrapper"""
 
-    def __init__(self, beaver_config):
+    def __init__(self, beaver_config, logger=None):
         """Child classes should build a subprocess via the following method:
 
            self._subprocess = subprocess.Popen(cmd, stdout=subprocess.PIPE, preexec_fn=os.setsid)
@@ -25,8 +27,12 @@ class BeaverSubprocess(object):
         This will allow us to attach a session id to the spawned child, allowing
         us to send a SIGTERM to the process on close
         """
+        super(BeaverSubprocess, self).__init__(logger=logger)
+        self._log_template = '[BeaverSubprocess] - {0}'
+
         self._beaver_config = beaver_config
         self._subprocess = None
+        self._logger = logger
 
     def poll(self):
         """Poll attached subprocess until it is available"""
@@ -45,8 +51,9 @@ class BeaverSubprocess(object):
 class BeaverSshTunnel(BeaverSubprocess):
     """SSH Tunnel Subprocess Wrapper"""
 
-    def __init__(self, beaver_config):
-        super(BeaverSshTunnel, self).__init__(beaver_config)
+    def __init__(self, beaver_config, logger=None):
+        super(BeaverSshTunnel, self).__init__(beaver_config, logger=logger)
+        self._log_template = '[BeaverSshTunnel] - {0}'
 
         key_file = beaver_config.get('ssh_key_file')
         tunnel = beaver_config.get('ssh_tunnel')
@@ -54,7 +61,37 @@ class BeaverSshTunnel(BeaverSubprocess):
         remote_host = beaver_config.get('ssh_remote_host')
         remote_port = beaver_config.get('ssh_remote_port')
 
-        self._subprocess = subprocess.Popen(["ssh", "-i", key_file, "-f", tunnel, "-L",
-            "{0}:{1}:{2}".format(tunnel_port, remote_host, remote_port),
-            "sleep 5"], stdout=subprocess.PIPE, preexec_fn=os.setsid)
+        ssh_opts = []
+        if self.get_port(tunnel):
+            ssh_opts.append('-p {0}'.format(self.get_port(tunnel)))
+            tunnel = self.get_host(tunnel)
+
+        ssh_opts.append('-n')
+        ssh_opts.append('-N')
+        ssh_opts.append('-o BatchMode=yes')
+
+        command = 'while true; do ssh {0} -i "{4}" "{5}" -L "{1}:{2}:{3}"; sleep 10; done'
+        command = command.format(' '.join(ssh_opts), tunnel_port, remote_host, remote_port, key_file, tunnel)
+        self._log_debug('Running ssh command: {0}'.format(command))
+        self._subprocess = subprocess.Popen(['/bin/sh', '-c', command], preexec_fn=os.setsid)
+
         self.poll()
+
+    def get_host(self, tunnel=None):
+        port = self.get_port(tunnel)
+        if not port:
+            return tunnel
+
+        return tunnel[0:-(len(port) + 1)]
+
+    def get_port(self, tunnel=None):
+        host_port = None
+        port = None
+
+        if tunnel:
+            host_port = tunnel.split('@')[-1]
+
+        if host_port and len(host_port.split(':')) == 2:
+            port = host_port.split(':')[-1]
+
+        return port

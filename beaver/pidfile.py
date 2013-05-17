@@ -13,16 +13,16 @@ class PidFile(object):
 
     def __init__(self, path):
         """Initializes path for pidfile"""
-        self.path = path
+        self.path = os.path.realpath(path)
         self.pidfile = None
 
     def __enter__(self):
         """Writes the pid of the current process to the path"""
-        self.pidfile = open(self.path, "a+")
+        self.pidfile = open(self.path, 'a+')
         try:
             fcntl.flock(self.pidfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except IOError:
-            raise SystemExit("Already running according to " + self.path)
+            raise SystemExit('Already running according to {0}'.format(self.path))
         self.pidfile.seek(0)
         self.pidfile.truncate()
         self.pidfile.write(str(os.getpid()))

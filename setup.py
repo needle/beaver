@@ -10,21 +10,29 @@ try:
 except ImportError:
     from distutils.core import setup
 
+# Hack to prevent stupid TypeError: 'NoneType' object is not callable error on
+# exit of python setup.py test # in multiprocessing/util.py _exit_function when
+# running python setup.py test (see
+# http://www.eby-sarna.com/pipermail/peak/2010-May/003357.html)
+try:
+    import multiprocessing
+    multiprocessing
+except ImportError:
+    pass
 
+requirements = open('requirements/base.txt').readlines()
 if sys.version_info[:2] <= (2, 6):
-    requirements = open('requirements/base26.txt').readlines()
-else:
-    requirements = open('requirements/base.txt').readlines()
+    requirements.extend(open('requirements/base26.txt').readlines())
 
 setup(
     name='Beaver',
     version=__version__,
     author='Jose Diaz-Gonzalez',
     author_email='support@savant.be',
-    packages=['beaver', 'beaver.tests'],
+    packages=['beaver', 'beaver.dispatcher', 'beaver.tests', 'beaver.transports', 'beaver.worker'],
     scripts=['bin/beaver'],
     url='http://github.com/josegonzalez/beaver',
-    license=open('LICENSE.txt').read(),
+    license='LICENSE.txt',
     classifiers=[
         'Development Status :: 5 - Production/Stable',
         'Intended Audience :: System Administrators',
@@ -35,7 +43,7 @@ setup(
     ],
     description='python daemon that munches on logs and sends their contents to logstash',
     long_description=open('README.rst').read() + '\n\n' +
-                     open('CHANGES.rst').read(),
+                open('CHANGES.rst').read(),
     tests_require=['nose', 'mock', 'fakeredis'],
     test_suite='nose.collector',
     install_requires=requirements,

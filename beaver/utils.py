@@ -5,15 +5,19 @@ import itertools
 import logging
 import platform
 import re
+import os
 import sys
 
 import beaver
 
 logging.basicConfig()
 
-MAGIC_BRACKETS = re.compile("({([^}]+)})")
-IS_GZIPPED_FILE = re.compile(".gz$")
+MAGIC_BRACKETS = re.compile('({([^}]+)})')
+IS_GZIPPED_FILE = re.compile('.gz$')
 REOPEN_FILES = 'linux' not in platform.platform().lower()
+CAN_DAEMONIZE = sys.platform != 'win32'
+
+cached_regices = {}
 
 
 def parse_args():
@@ -30,6 +34,7 @@ def parse_args():
     """
     parser = argparse.ArgumentParser(description='Beaver logfile shipper', epilog=epilog_example, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('-c', '--configfile', help='ini config file path', dest='config', default='/dev/null')
+    parser.add_argument('-C', '--confd-path', help='path to conf.d directory', dest='confd_path', default='/etc/beaver/conf.d')
     parser.add_argument('-d', '--debug', help='enable debug mode', dest='debug', default=False, action='store_true')
     parser.add_argument('-D', '--daemonize', help='daemonize in the background', dest='daemonize', default=False, action='store_true')
     parser.add_argument('-f', '--files', help='space-separated filelist to watch, can include globs (*.log). Overrides --path argument', dest='files', default=None, nargs='+')
@@ -40,38 +45,46 @@ def parse_args():
     parser.add_argument('-p', '--path', help='path to log files', default=None, dest='path')
     parser.add_argument('-P', '--pid', help='path to pid file', default=None, dest='pid')
     parser.add_argument('-t', '--transport', help='log transport method', dest='transport', default=None, choices=['rabbitmq', 'redis', 'sqs', 'stdout', 'udp', 'zmq'])
+    parser.add_argument('-e', '--experimental', help='use experimental version of beaver', dest='experimental', default=False, action='store_true')
     parser.add_argument('-v', '--version', help='output version and quit', dest='version', default=False, action='store_true')
-    parser.add_argument('--fqdn', help="use the machine's FQDN for source_host", dest="fqdn", default=False, action='store_true')
+    parser.add_argument('--fqdn', help='use the machine\'s FQDN for source_host', dest='fqdn', default=False, action='store_true')
 
     return parser.parse_args()
 
 
-def setup_custom_logger(name, args=None, output=None, formatter=None):
+def setup_custom_logger(name, args=None, output=None, formatter=None, debug=None):
     logger = logging.getLogger(name)
     logger.propagate = False
     if logger.handlers:
         logger.handlers = []
 
     has_args = args is not None and type(args) == argparse.Namespace
-    is_debug = has_args and args.debug == True
+    if debug is None:
+        debug = has_args and args.debug is True
 
     if not logger.handlers:
         if formatter is None:
             formatter = logging.Formatter('[%(asctime)s] %(levelname)-7s %(message)s')
 
         handler = logging.StreamHandler()
-        if output is None and has_args and args.daemonize:
+        if output is None and has_args:
             output = args.output
 
+        if output:
+            output = os.path.realpath(output)
+
         if output is not None:
-            handler = logging.FileHandler(output)
+            file_handler = logging.FileHandler(output)
+            if formatter is not False:
+                file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
 
         if formatter is not False:
             handler.setFormatter(formatter)
 
         logger.addHandler(handler)
 
-    if is_debug:
+    if debug:
         logger.setLevel(logging.DEBUG)
         if hasattr(logging, 'captureWarnings'):
             logging.captureWarnings(True)
@@ -93,35 +106,43 @@ def version(args):
         sys.exit(0)
 
 
-def eglob(path):
+def eglob(path, exclude=None):
     """Like glob.glob, but supports "/path/**/{a,b,c}.txt" lookup"""
     fi = itertools.chain.from_iterable
-    paths = expand_paths(path)
-    return list(fi(glob2.iglob(d) for d in paths))
+    paths = list(fi(glob2.iglob(d) for d in expand_paths(path)))
+    if exclude:
+        cached_regex = cached_regices.get(exclude, None)
+        if not cached_regex:
+            cached_regex = cached_regices[exclude] = re.compile(exclude)
+        paths = [x for x in paths if not cached_regex.search(x)]
+
+    return paths
 
 
 def expand_paths(path):
     """When given a path with brackets, expands it to return all permutations
        of the path with expanded brackets, similar to ant.
 
-       >>> expand_paths("../{a,b}/{c,d}")
+       >>> expand_paths('../{a,b}/{c,d}')
        ['../a/c', '../a/d', '../b/c', '../b/d']
-       >>> expand_paths("../{a,b}/{a,b}.py")
+       >>> expand_paths('../{a,b}/{a,b}.py')
        ['../a/a.py', '../a/b.py', '../b/a.py', '../b/b.py']
-       >>> expand_paths("../{a,b,c}/{a,b,c}")
+       >>> expand_paths('../{a,b,c}/{a,b,c}')
        ['../a/a', '../a/b', '../a/c', '../b/a', '../b/b', '../b/c', '../c/a', '../c/b', '../c/c']
-       >>> expand_paths("test")
+       >>> expand_paths('test')
        ['test']
-       >>> expand_paths("")
+       >>> expand_paths('')
     """
     pr = itertools.product
     parts = MAGIC_BRACKETS.findall(path)
-    if path == "":
+
+    if not path:
         return
-    elif not parts:
+
+    if not parts:
         return [path]
 
-    permutations = [[(p[0], i, 1) for i in p[1].split(",")] for p in parts]
+    permutations = [[(p[0], i, 1) for i in p[1].split(',')] for p in parts]
     return [_replace_all(path, i) for i in pr(*permutations)]
 
 
